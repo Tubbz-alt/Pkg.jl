@@ -10,7 +10,8 @@ import REPL
 using REPL.TerminalMenus
 using ..Types, ..Resolve, ..PlatformEngines, ..GitTools, ..MiniProgressBars
 import ..depots, ..depots1, ..devdir, ..set_readonly, ..Types.PackageEntry
-import ..Artifacts: ensure_all_artifacts_installed, artifact_names, extract_all_hashes, artifact_exists
+import ..Artifacts: ensure_artifact_installed, artifact_names, extract_all_hashes,
+                    artifact_exists, select_downloadable_artifacts
 using Base.BinaryPlatforms
 import ...Pkg
 import ...Pkg: pkg_server, Registry, pathrepr, can_fancyprint, printpkgstyle
@@ -585,6 +586,11 @@ function download_artifacts(env::EnvCache, pkgs::Vector{PackageSpec}; platform::
                             verbose::Bool=false)
     # Filter out packages that have no source_path()
     # pkg_roots = String[p for p in source_path.((env.project_file,), pkgs) if p !== nothing]  # this runs up against inference limits?
+    
+    # Ensure pkgs are sorted in dependency order
+    order = dependency_order_uuids(env, UUID[pkg.uuid for pkg in pkgs if pkg.uuid !== nothing])
+    sort!(pkgs, by = pkg -> order[pkg.uuid])
+
     pkg_roots = String[]
     for pkg in pkgs
         p = source_path(env.project_file, pkg)
@@ -596,22 +602,37 @@ end
 function download_artifacts(pkg_roots::Vector{String}; platform::AbstractPlatform=HostPlatform(),
                             verbose::Bool=false)
     # List of Artifacts.toml files that we're going to download from
-    artifacts_tomls = String[]
+    artifacts_tomls = Tuple{String,Dict}[]
 
     for path in pkg_roots
         # Check to see if this package has an (Julia)Artifacts.toml
         for f in artifact_names
             artifacts_toml = joinpath(path, f)
             if isfile(artifacts_toml)
-                push!(artifacts_tomls, artifacts_toml)
+                selector_path = joinpath(path, ".pkg", "select_artifacts.jl")
+
+                if isfile(selector_path)
+                    meta_toml = String(read(```
+                        $(Base.julia_cmd()) --color=no --history-file=no -O0 --startup-file=no
+                                            --project=$(path) $(selector_path)
+                    ```))
+                    push!(artifacts_tomls, (artifacts_toml, TOML.parse(meta_toml)))
+                else
+                    artifacts = select_downloadable_artifacts(artifacts_toml; platform)
+                    push!(artifacts_tomls, (artifacts_toml, artifacts))
+                end
                 break
             end
         end
     end
 
     if !isempty(artifacts_tomls)
-        for artifacts_toml in artifacts_tomls
-            ensure_all_artifacts_installed(artifacts_toml; platform=platform, verbose=verbose, quiet_download=!(stderr isa Base.TTY))
+        for (artifacts_toml, artifacts) in artifacts_tomls
+            # For each Artifacts.toml, install each artifact we've collected from it
+            for name in keys(artifacts)
+                ensure_artifact_installed(name, artifacts[name], artifacts_toml;
+                                          verbose=verbose, quiet_download=!(stderr isa Base.TTY))
+            end
             write_env_usage(artifacts_toml, "artifact_usage.toml")
         end
     end
@@ -814,7 +835,6 @@ function dependency_order_uuids(env::EnvCache, uuids::Vector{UUID})::Dict{UUID,I
     seen = UUID[]
     k = 0
     function visit(uuid::UUID)
-        is_stdlib(uuid) && return
         uuid in seen &&
             return @warn("Dependency graph not a DAG, linearizing anyway")
         haskey(order, uuid) && return
@@ -823,7 +843,11 @@ function dependency_order_uuids(env::EnvCache, uuids::Vector{UUID})::Dict{UUID,I
             deps = values(env.project.deps)
         else
             entry = manifest_info(env.manifest, uuid)
-            deps = values(entry.deps)
+            if entry !== nothing
+                deps = values(entry.deps)
+            else
+                deps = []
+            end
         end
         foreach(visit, deps)
         pop!(seen)
